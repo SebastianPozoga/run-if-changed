@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"sort"
+	"sync"
 
 	"github.com/goatcms/goatcore/filesystem"
 	"github.com/goatcms/goatcore/varutil"
@@ -15,6 +16,11 @@ import (
 type WalkParams struct {
 	CB    func(path string, info os.FileInfo) (err error)
 	Paths WalkPaths
+}
+
+type WalkCBParams struct {
+	Path string
+	Info os.FileInfo
 }
 
 type Hasher struct {
@@ -60,19 +66,43 @@ func (hasher *Hasher) Hash(paths WalkPaths) (result []byte, err error) {
 }
 
 func (hasher *Hasher) Walk(params WalkParams) (err error) {
+	var (
+		ch = make(chan WalkCBParams, 2000)
+		wg = &sync.WaitGroup{}
+	)
+	defer func() {
+		if r := recover(); r != nil {
+			err = r.(error)
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		for {
+			cbParams, more := <-ch
+			if !more {
+				wg.Done()
+				return
+			}
+			if err = params.CB(cbParams.Path, cbParams.Info); err != nil {
+				panic(err)
+			}
+		}
+	}()
 	sort.Strings(params.Paths.Includes)
 	for _, node := range params.Paths.Includes {
 		if !hasher.cwd.IsExist(node) {
 			return fmt.Errorf("node '%s does not exist", node)
 		}
-		if err = hasher.walk(params, node); err != nil {
+		if err = hasher.walk(params, node, ch); err != nil {
 			return
 		}
 	}
+	close(ch)
+	wg.Wait()
 	return
 }
 
-func (hasher *Hasher) walk(params WalkParams, includePath string) (err error) {
+func (hasher *Hasher) walk(params WalkParams, includePath string, ch chan<- WalkCBParams) (err error) {
 	var (
 		infos    []fs.FileInfo
 		basePath string
@@ -86,7 +116,10 @@ func (hasher *Hasher) walk(params WalkParams, includePath string) (err error) {
 		if info, err = hasher.cwd.Lstat(includePath); err != nil {
 			return
 		}
-		return params.CB(includePath, info)
+		ch <- WalkCBParams{
+			Path: includePath,
+			Info: info,
+		}
 	}
 	basePath = includePath + "/"
 	if infos, err = hasher.cwd.ReadDir(includePath); err != nil {
@@ -105,13 +138,14 @@ func (hasher *Hasher) walk(params WalkParams, includePath string) (err error) {
 		}
 		if node.IsDir() {
 			hasher.logs.Dev.Log("dir %s", includePath)
-			if err = hasher.walk(params, nodePath); err != nil {
+			if err = hasher.walk(params, nodePath, ch); err != nil {
 				return
 			}
 			continue
 		}
-		if err = params.CB(nodePath, node); err != nil {
-			return
+		ch <- WalkCBParams{
+			Path: nodePath,
+			Info: node,
 		}
 	}
 	return
